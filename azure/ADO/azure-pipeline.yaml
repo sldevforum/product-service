@@ -1,0 +1,176 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  vmImage: 'ubuntu-latest'
+  goVersion: '1.22.x'
+  azureServiceConnection: 'az-spn-conn'           # TODO: your ADO service connection
+  azureResourceGroup: 'rg-devsecops-demo'         # TODO
+  acrName: 'mydemoacr'                            # TODO
+  acrLoginServer: 'mydemoacr.azurecr.io'          # TODO
+  imageName: 'go-microservice'                    # TODO
+  webAppName: 'my-demo-webapp-1234'               # TODO
+  greenSlot: 'green'
+  appPort: '8080'
+  zapTargetUrl: 'https://my-demo-webapp-1234-green.azurewebsites.net'   # scan GREEN before swap
+
+stages:
+# 1) Build & Unit Test
+- stage: Build_Test
+  jobs:
+  - job: build
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - checkout: self
+    - task: GoTool@0
+      inputs: { version: $(goVersion) }
+    - script: |
+        go mod download
+        go build ./...
+        go test ./... -coverprofile=coverage.out
+      displayName: Go build & test
+
+# 2) SAST & Dep checks (staticcheck, govet, gosec, govulncheck)
+- stage: SAST
+  dependsOn: Build_Test
+  jobs:
+  - job: sast
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - checkout: self
+    - script: |
+        curl -sSfL https://raw.githubusercontent.com/dominikh/go-tools/master/cmd/staticcheck/install.sh | sh -s latest
+        ./bin/staticcheck ./...
+        go vet ./...
+      displayName: staticcheck + govet
+    - script: |
+        go install github.com/securego/gosec/v2/cmd/gosec@latest
+        $(go env GOPATH)/bin/gosec -no-fail -fmt=json -out=gosec.json ./...
+        jq -e '[.Issues[] | select(.Severity=="HIGH")] | length == 0' gosec.json
+      displayName: gosec (fail on HIGH)
+    - script: |
+        go install golang.org/x/vuln/cmd/govulncheck@latest
+        $(go env GOPATH)/bin/govulncheck ./... || true
+      displayName: govulncheck (non-blocking)
+
+# 3) Container & IaC (hadolint, checkov)
+- stage: Lint_Scan_IaC
+  dependsOn: SAST
+  jobs:
+  - job: lint_iac
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - checkout: self
+    - script: |
+        curl -sSL https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64 -o hadolint
+        chmod +x hadolint
+        if [ -f Dockerfile ]; then ./hadolint Dockerfile; else echo "No Dockerfile"; fi
+      displayName: Hadolint
+    - script: |
+        pipx install checkov || pip install --user checkov
+        checkov -d . -o json > checkov.json || true
+        python - << 'PY'
+import json,sys
+d=json.load(open('checkov.json'))
+def allres(x): 
+  return [x] if isinstance(x,dict) else x
+high=0
+for r in allres(d):
+  for fc in r.get('results',{}).get('failed_checks',[]):
+    if fc.get('severity','').upper() in ('HIGH','CRITICAL'): high+=1
+print("HIGH/CRITICAL:", high)
+sys.exit(1 if high>0 else 0)
+PY
+      displayName: Checkov (fail on HIGH/CRITICAL)
+
+# 4) Build image, Trivy scan, push to ACR
+- stage: Package
+  dependsOn: Lint_Scan_IaC
+  jobs:
+  - job: docker
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name $(acrName)
+    - script: |
+        IMAGE_TAG=$(Build.BuildId)
+        echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+        docker build -t $(acrLoginServer)/$(imageName):$IMAGE_TAG .
+      displayName: Docker build
+    - script: |
+        curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b . v0.53.0
+        ./trivy image --severity HIGH,CRITICAL --exit-code 1 $(acrLoginServer)/$(imageName):$(IMAGE_TAG)
+      displayName: Trivy image scan (fail on HIGH/CRITICAL)
+    - script: |
+        docker push $(acrLoginServer)/$(imageName):$(IMAGE_TAG)
+      displayName: Push to ACR
+
+# 5) Deploy to GREEN slot + smoke + ZAP
+- stage: Deploy_Green_Test
+  dependsOn: Package
+  jobs:
+  - job: deploy_green
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - task: AzureCLI@2
+      displayName: "Deploy image to GREEN slot"
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          IMAGE="$(acrLoginServer)/$(imageName):$(IMAGE_TAG)"
+          az webapp config container set \
+            --name $(webAppName) \
+            --resource-group $(azureResourceGroup) \
+            --slot $(greenSlot) \
+            --docker-custom-image-name $IMAGE \
+            --docker-registry-server-url "https://$(acrLoginServer)"
+          az webapp restart --name $(webAppName) --resource-group $(azureResourceGroup) --slot $(greenSlot)
+
+    - script: |
+        # Simple health check against GREEN
+        set -e
+        for i in {1..20}; do
+          curl -fsS "$(zapTargetUrl)/health" && exit 0 || sleep 5
+        done
+        echo "Green slot health check failed"; exit 1
+      displayName: "Smoke test GREEN"
+
+    - script: |
+        docker run --rm -t owasp/zap2docker-stable zap-baseline.py \
+          -t "$(zapTargetUrl)" -r zap_report.html -m 5
+      displayName: "OWASP ZAP Baseline on GREEN"
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathtoPublish: zap_report.html
+        artifactName: zap-report
+
+# 6) Swap GREEN -> PRODUCTION (blue/green cutover)
+- stage: Swap_To_Production
+  dependsOn: Deploy_Green_Test
+  condition: succeeded()     # tighten by parsing ZAP report if you want
+  jobs:
+  - job: swap
+    pool: { vmImage: $(vmImage) }
+    steps:
+    - task: AzureCLI@2
+      displayName: "Swap GREEN -> PRODUCTION"
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az webapp deployment slot swap \
+            --resource-group $(azureResourceGroup) \
+            --name $(webAppName) \
+            --slot $(greenSlot) \
+            --target-slot production

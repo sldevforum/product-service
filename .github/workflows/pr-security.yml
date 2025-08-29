@@ -1,0 +1,55 @@
+name: PR Security & Cost
+on:
+  pull_request: { branches: [main] }
+  push:
+    branches: ["feature/**", "bugfix/**", "chore/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep-checkov-infracost:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Semgrep (SAST for Go, etc.) -----
+      - name: Install Semgrep
+        run: pipx install semgrep || pip install --user semgrep
+      - name: Semgrep scan (auto rules)
+        run: semgrep ci --config auto
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }} # optional
+
+      # ----- Checkov (IaC: only if infra/terraform/ exists) -----
+      - name: Checkov on Terraform
+        if: ${{ hashFiles('infra/terraform/**') != '' }}
+        run: |
+          pipx install checkov || pip install --user checkov
+          checkov -d infra/terraform --quiet
+
+      # ----- Infracost (optional; TF only) -----
+      - name: Install Infracost
+        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
+        run: curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+      - name: Infracost breakdown (artifact + PR comment)
+        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+        run: |
+          infracost breakdown --path infra/terraform --format json --out-file infracost.json
+          echo "Posting PR comment..."
+          infracost comment github --path infracost.json \
+            --repo ${{ github.repository }} \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --behavior update
+      - name: Upload Infracost artifact
+        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost
+          path: infracost.json

@@ -1,14 +1,13 @@
-name: PR Security & Cost
+name: PR Security
+
 on:
-  pull_request: { branches: [main] }
-  push:
-    branches: ["feature/**", "bugfix/**", "chore/**"] # optional
+  pull_request:
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# These permissions let Infracost post a PR comment.
 permissions:
   contents: read
   pull-requests: write
@@ -19,47 +18,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Semgrep
         run: pipx install semgrep || pip install --user semgrep
-      - name: Run Semgrep
-        # If you added SEMGREP_APP_TOKEN, Semgrep will upload to semgrep.dev
+
+      - name: Run Semgrep (auto rules)
         env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }} # optional
+          # Optional: if set, results also appear in semgrep.dev dashboard
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
         run: semgrep ci --config auto
 
   checkov:
     name: Checkov (IaC)
-    if: ${{ hashFiles('infra/terraform/**') != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Detect Terraform folder
+        id: detect_tf
+        run: |
+          if [ -d infra/terraform ]; then
+            echo "has_tf=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_tf=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install Checkov
+        if: steps.detect_tf.outputs.has_tf == 'true'
         run: pipx install checkov || pip install --user checkov
-      - name: Scan Terraform
+
+      - name: Scan Terraform with Checkov
+        if: steps.detect_tf.outputs.has_tf == 'true'
         run: checkov -d infra/terraform --quiet
 
-  infracost:
-    name: Infracost (Cost)
-    if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Infracost
-        run: curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
-      - name: Infracost breakdown
-        env:
-          INFRACOST_API_KEY: ico-L77peDwqm1ChsL1MazL719JaPlGXC34G
-        run: infracost breakdown --path infra/terraform --format json --out-file infracost.json
-      - name: Comment PR with cost diff
-        env:
-          INFRACOST_API_KEY: ico-L77peDwqm1ChsL1MazL719JaPlGXC34G
-        run: |
-          infracost comment github --path infracost.json \
-            --repo ${{ github.repository }} \
-            --pull-request ${{ github.event.pull_request.number }} \
-            --behavior update
-      - name: Upload Infracost artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: infracost
-          path: infracost.json
+      - name: Skip (no infra/terraform found)
+        if: steps.detect_tf.outputs.has_tf != 'true'
+        run: echo "Skipping Checkov: no infra/terraform directory."

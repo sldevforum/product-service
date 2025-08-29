@@ -1,0 +1,72 @@
+name: PR Infracost (minimal)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  infracost:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Terraform folder & API key
+        id: pre
+        run: |
+          if [ -d infra/terraform ]; then echo "has_tf=true" >> "$GITHUB_OUTPUT"; else echo "has_tf=false" >> "$GITHUB_OUTPUT"; fi
+          if [ -n "${{ secrets.INFRACOST_API_KEY }}" ]; then echo "has_key=true" >> "$GITHUB_OUTPUT"; else echo "has_key=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Setup Infracost
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      # Baseline = PR base commit
+      - name: Checkout base ref
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Generate baseline cost (base)
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        run: |
+          infracost breakdown \
+            --path infra/terraform \
+            --format json \
+            --out-file /tmp/infracost-base.json
+
+      # Compare with PR head
+      - name: Checkout PR head
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Generate cost diff (PR vs base)
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        run: |
+          infracost diff \
+            --path infra/terraform \
+            --format json \
+            --compare-to /tmp/infracost-base.json \
+            --out-file /tmp/infracost.json
+
+      - name: Post PR comment
+        if: steps.pre.outputs.has_tf == 'true' && steps.pre.outputs.has_key == 'true'
+        run: |
+          infracost comment github \
+            --path /tmp/infracost.json \
+            --repo $GITHUB_REPOSITORY \
+            --github-token ${{ github.token }} \
+            --pull-request ${{ github.event.pull_request.number }} \
+            --behavior update
+
+      - name: Skip (no TF or missing API key)
+        if: steps.pre.outputs.has_tf != 'true' || steps.pre.outputs.has_key != 'true'
+        run: echo "Skipping Infracost: needs infra/terraform and INFRACOST_API_KEY."

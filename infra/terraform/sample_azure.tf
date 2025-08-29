@@ -64,3 +64,4 @@ resource "azurerm_linux_function_app" "my_function" {
 }
 
 #readme
+#newline

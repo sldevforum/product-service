@@ -1,5 +1,4 @@
 name: PR Security
-
 on:
   pull_request:
     types: [opened, synchronize, reopened]
@@ -18,15 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Semgrep
         run: pipx install semgrep || pip install --user semgrep
-
       - name: Run Semgrep (auto rules)
         env:
-          # Optional: if set, results also appear in semgrep.dev dashboard
+          # Optional; without it, results still show in job logs
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-        run: semgrep ci --config auto
+        run: |
+          semgrep ci --config auto
 
   checkov:
     name: Checkov (IaC)
@@ -44,13 +42,15 @@ jobs:
           fi
 
       - name: Install Checkov
-        if: steps.detect_tf.outputs.has_tf == 'true'
+        if: ${{ steps.detect_tf.outputs.has_tf == 'true' }}
         run: pipx install checkov || pip install --user checkov
 
       - name: Scan Terraform with Checkov
-        if: steps.detect_tf.outputs.has_tf == 'true'
-        run: checkov -d infra/terraform --quiet
+        if: ${{ steps.detect_tf.outputs.has_tf == 'true' }}
+        run: |
+          checkov -d infra/terraform --quiet
 
       - name: Skip (no infra/terraform found)
-        if: steps.detect_tf.outputs.has_tf != 'true'
-        run: echo "Skipping Checkov: no infra/terraform directory."
+        if: ${{ steps.detect_tf.outputs.has_tf != 'true' }}
+        run: |
+          echo "Skipping Checkov: no infra/terraform directory."

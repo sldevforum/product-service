@@ -2,53 +2,63 @@ name: PR Security & Cost
 on:
   pull_request: { branches: [main] }
   push:
-    branches: ["feature/**", "bugfix/**", "chore/**"]
+    branches: ["feature/**", "bugfix/**", "chore/**"] # optional
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# These permissions let Infracost post a PR comment.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  semgrep-checkov-infracost:
+  semgrep:
+    name: Semgrep (SAST)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-
-      # ----- Semgrep (SAST for Go, etc.) -----
       - name: Install Semgrep
         run: pipx install semgrep || pip install --user semgrep
-      - name: Semgrep scan (auto rules)
-        run: semgrep ci --config auto
+      - name: Run Semgrep
+        # If you added SEMGREP_APP_TOKEN, Semgrep will upload to semgrep.dev
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }} # optional
+        run: semgrep ci --config auto
 
-      # ----- Checkov (IaC: only if infra/terraform/ exists) -----
-      - name: Checkov on Terraform
-        if: ${{ hashFiles('infra/terraform/**') != '' }}
-        run: |
-          pipx install checkov || pip install --user checkov
-          checkov -d infra/terraform --quiet
+  checkov:
+    name: Checkov (IaC)
+    if: ${{ hashFiles('infra/terraform/**') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Checkov
+        run: pipx install checkov || pip install --user checkov
+      - name: Scan Terraform
+        run: checkov -d infra/terraform --quiet
 
-      # ----- Infracost (optional; TF only) -----
+  infracost:
+    name: Infracost (Cost)
+    if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Install Infracost
-        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
         run: curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
-      - name: Infracost breakdown (artifact + PR comment)
-        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
+      - name: Infracost breakdown
         env:
-          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+          INFRACOST_API_KEY: ico-L77peDwqm1ChsL1MazL719JaPlGXC34G
+        run: infracost breakdown --path infra/terraform --format json --out-file infracost.json
+      - name: Comment PR with cost diff
+        env:
+          INFRACOST_API_KEY: ico-L77peDwqm1ChsL1MazL719JaPlGXC34G
         run: |
-          infracost breakdown --path infra/terraform --format json --out-file infracost.json
-          echo "Posting PR comment..."
           infracost comment github --path infracost.json \
             --repo ${{ github.repository }} \
             --pull-request ${{ github.event.pull_request.number }} \
             --behavior update
       - name: Upload Infracost artifact
-        if: ${{ hashFiles('infra/terraform/**') != '' && secrets.INFRACOST_API_KEY != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: infracost
